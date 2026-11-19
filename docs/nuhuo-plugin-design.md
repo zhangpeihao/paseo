@@ -47,9 +47,8 @@ agents and providers. That daemon is out of scope: the plugin never runs there.
 Version 3 gave each employee one host prepared by Nuhuo and pushed a bundle to it. Version 4 had IT
 configure hosts and gateway credentials. Version 5 had the employee link each host with a key Nuhuo
 held. All three are replaced. Nuhuo's [host inventory design](../../nuhuo/docs/host-inventory-design.md) owns how hosts reach
-employees. The rest of the Nuhuo half lives in
-[Nuhuo's integration design](../../nuhuo/docs/paseo-integration-design.md); its release, variant, and
-mode-ID rules still apply, and its import model predates this version.
+employees. The rest of the Nuhuo half, from accounts to the host API, lives in
+[Nuhuo's integration design](../../nuhuo/docs/paseo-integration-design.md).
 
 ## 2. What Paseo provides today
 
@@ -174,8 +173,8 @@ makes its models available in Nuhuo's Worker form.
 
 The employee creates a Worker in Nuhuo by choosing one of their hosts, a Role, one of their
 providers, a model, a mode, a thinking level, and a working directory on that host. Nuhuo offers only
-what expert policy allows and what the host's last inventory reports, so mode and thinking are Paseo
-IDs from that host, as [Nuhuo §5.3](../../nuhuo/docs/paseo-integration-design.md#53-mode-and-thinking-ids)
+what the Role's policy allows and what the host's last inventory reports, so mode and thinking are
+Paseo IDs from that host, as [Nuhuo §6.3](../../nuhuo/docs/paseo-integration-design.md#63-mode-and-thinking-ids)
 requires. On save, Nuhuo publishes a release. Moving a Worker to another host removes it from the old
 one.
 
@@ -481,16 +480,16 @@ fields optional. The plugin checks the features once and keeps phase 1 behavior 
 
 ## 10. Nuhuo dependencies
 
-| Item                                                                                                                                                               | Status                                                                                                          |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| Authenticate the service before exposing it beyond loopback ([Nuhuo §3](../../nuhuo/docs/paseo-integration-design.md#3-prerequisite-authenticate-the-service-n00)) | Blocking: Nuhuo holds API keys and the management credentials of every host, and hosts call it over the network |
-| Accounts with IT, expert, and employee roles, and sign-in                                                                                                          | New                                                                                                             |
-| [Host inventory](../../nuhuo/docs/host-inventory-design.md): sources, import, allocation, accounts and SSH keys, **My hosts**, reclaim                             | Extends the host probe and `HostEntry`, which already has SSH fields and `pairingLink`                          |
-| Paseo setup run by the inventory ([§5.2](#52-set-up-paseo-on-a-host))                                                                                              | New                                                                                                             |
-| Employee providers with encrypted API keys                                                                                                                         | New                                                                                                             |
-| Worker form limited by expert policy and the host's inventory                                                                                                      | Extends `WorkerMetadata` (`hostId`, `agent`, `model`, `mode`, `thinking`, `workDir`)                            |
-| Host API ([§6.2](#62-catalog)) and Skill archives addressed by digest                                                                                              | New                                                                                                             |
-| Releases with a verified `paseo` variant                                                                                                                           | Specified in Nuhuo §5                                                                                           |
+| Item                                                                                                                                                               | Status                                                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| Authenticate the service before exposing it beyond loopback ([Nuhuo §3](../../nuhuo/docs/paseo-integration-design.md#3-prerequisite-authenticate-the-service-n00)) | N00. Blocking: Nuhuo holds API keys and the management credentials of every host, and hosts call it over the network |
+| Accounts with IT, expert, and employee roles, and sign-in ([Nuhuo §4](../../nuhuo/docs/paseo-integration-design.md#4-accounts-and-roles))                          | N01                                                                                                                  |
+| [Host inventory](../../nuhuo/docs/host-inventory-design.md): sources, import, allocation, accounts and SSH keys, **My hosts**, reclaim                             | N08; extends the host probe and `HostEntry`                                                                          |
+| Paseo setup run by the inventory ([§5.2](#52-set-up-paseo-on-a-host))                                                                                              | N08                                                                                                                  |
+| Employee providers and secrets, encrypted ([Nuhuo §5](../../nuhuo/docs/paseo-integration-design.md#5-providers-and-secrets))                                       | N05                                                                                                                  |
+| Worker form limited by Role policy and the host's inventory ([Nuhuo §6](../../nuhuo/docs/paseo-integration-design.md#6-workers-and-releases))                      | N02, N06; extends `WorkerMetadata`                                                                                   |
+| Host API ([§6.2](#62-catalog), [Nuhuo §7](../../nuhuo/docs/paseo-integration-design.md#7-host-api)) and Skill archives addressed by digest                         | N07                                                                                                                  |
+| Releases, Role publication checks, and a side-effect-free resolver ([Nuhuo §6.7](../../nuhuo/docs/paseo-integration-design.md#67-publication-checks))              | N03, N04                                                                                                             |
 
 ## 11. Verification
 
