@@ -1,0 +1,7 @@
+{
+  "id": "nuhuo",
+  "name": "Nuhuo",
+  "description": "Runs agents as the Workers Nuhuo assigns to this host",
+  "media": [],
+  "requirements": { "paseo": ">=0.17.0-0" }
+}
