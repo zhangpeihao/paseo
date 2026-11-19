@@ -1,6 +1,6 @@
 # Nuhuo enterprise plugin design
 
-Status: proposed, version 5, 19 November 2026. The code in [`nuhuo-plugin/`](../nuhuo-plugin/)
+Status: proposed, version 6, 19 November 2026. The code in [`nuhuo-plugin/`](../nuhuo-plugin/)
 implements version 3 (one host per employee, a bundle pushed to the host); [§7](#7-plugin-phase-1)
 lists what changes. Phase 2 is not started.
 
@@ -9,9 +9,10 @@ unless this doc names the file that implements them.
 
 ## 1. Outcome
 
-IT hands each employee one or more clean hosts and configures nothing for them. The employee adds
-their Nuhuo SSH public key to a host and links it in Nuhuo, which installs Paseo and the Nuhuo plugin.
-From then on the employee configures everything in Nuhuo:
+IT keeps the company's hosts in Nuhuo's [host inventory](../../nuhuo/docs/host-inventory-design.md) and allocates them to
+employees by count. Nuhuo creates the employee's account on each host, installs their SSH public keys,
+and sets up Paseo with the Nuhuo plugin. The employee sees their hosts in Nuhuo and configures
+everything else there:
 
 - Providers, each with the employee's own API key.
 - Workers, each picking one of their hosts, a Role, one of their providers, a model, a mode, a
@@ -25,25 +26,28 @@ Worker's host. AI experts maintain the Roles, Skills, and MCP server templates W
 The Paseo app on the employee's laptop also runs a local daemon, where the employee sets up their own
 agents and providers. That daemon is out of scope: the plugin never runs there.
 
-| Decision                                                                                                      | Source                                                 |
-| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| IT hands out clean hosts and configures nothing per employee; an employee can have many; a host has one owner | User, 19 Nov 2026                                      |
-| The employee links a host to Nuhuo with an SSH public key; Nuhuo sets the host up                             | User, 19 Nov 2026                                      |
-| Employees create providers with their own API keys in Nuhuo; agents are ready to use in Paseo                 | User, 19 Nov 2026                                      |
-| Employees create their own Workers in Nuhuo                                                                   | User, 19 Nov 2026                                      |
-| The plugin imports the employee's settings from Nuhuo; the employee chats in Paseo                            | User, 19 Nov 2026                                      |
-| Workers run as subagents of other Workers, across the employee's hosts                                        | User, 19 Nov 2026                                      |
-| Employees enroll their devices through a link; company SSO comes later                                        | User, 19 Nov 2026                                      |
-| Phase 1 uses only today's plugin API; core changes are phase 2                                                | User, 19 Nov 2026                                      |
-| Nuhuo keeps one SSH key pair per employee; the private key never leaves Nuhuo                                 | Proposal; see [§5.2](#52-link-a-host)                  |
-| Nuhuo uses SSH only to set up and repair a host; all settings arrive through the plugin's pull                | Proposal; see [§4](#4-topology)                        |
-| The plugin runs on every employee host and nowhere else                                                       | Proposal; see [§4](#4-topology)                        |
-| Each host links to the employee's other hosts, so one enrollment shows all of them                            | Proposal; see [§5.5](#55-enroll)                       |
-| Create and open decide from the host's cached catalog, so a Nuhuo outage stops no running work                | Proposal; see [§6.2](#62-catalog)                      |
-| Agents follow their Worker's current release on every open                                                    | Proposal; see [§6.6](#66-releases-and-existing-agents) |
+| Decision                                                                                                                         | Source                                                                                              |
+| -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| IT allocates hosts from Nuhuo's inventory by employee and count; an employee can have many; a host has one owner                 | User, 19 Nov 2026                                                                                   |
+| Nuhuo installs the employee's SSH public key and sets each allocated host up; nobody configures one by hand                      | User, 19 Nov 2026                                                                                   |
+| The employee sees all their hosts in Nuhuo                                                                                       | User, 19 Nov 2026                                                                                   |
+| Employees create providers with their own API keys in Nuhuo; agents are ready to use in Paseo                                    | User, 19 Nov 2026                                                                                   |
+| Employees create their own Workers in Nuhuo                                                                                      | User, 19 Nov 2026                                                                                   |
+| The plugin imports the employee's settings from Nuhuo; the employee chats in Paseo                                               | User, 19 Nov 2026                                                                                   |
+| Workers run as subagents of other Workers, across the employee's hosts                                                           | User, 19 Nov 2026                                                                                   |
+| Employees enroll their devices through a link; company SSO comes later                                                           | User, 19 Nov 2026                                                                                   |
+| Phase 1 uses only today's plugin API; core changes are phase 2                                                                   | User, 19 Nov 2026                                                                                   |
+| Nuhuo manages hosts with IT's credential for each source; the employee's account has no sudo unless IT grants it                 | Proposal; see [host inventory](../../nuhuo/docs/host-inventory-design.md#4-sources-and-credentials) |
+| Nuhuo reaches a host directly only to set it up, repair it, sync keys, and reclaim it; settings arrive through the plugin's pull | Proposal; see [§4](#4-topology)                                                                     |
+| The plugin runs on every employee host and nowhere else                                                                          | Proposal; see [§4](#4-topology)                                                                     |
+| Each host links to the employee's other hosts, so one enrollment shows all of them                                               | Proposal; see [§5.5](#55-enroll)                                                                    |
+| Create and open decide from the host's cached catalog, so a Nuhuo outage stops no running work                                   | Proposal; see [§6.2](#62-catalog)                                                                   |
+| Agents follow their Worker's current release on every open                                                                       | Proposal; see [§6.6](#66-releases-and-existing-agents)                                              |
 
 Version 3 gave each employee one host prepared by Nuhuo and pushed a bundle to it. Version 4 had IT
-configure hosts and gateway credentials. Both are replaced. The Nuhuo half lives in
+configure hosts and gateway credentials. Version 5 had the employee link each host with a key Nuhuo
+held. All three are replaced. Nuhuo's [host inventory design](../../nuhuo/docs/host-inventory-design.md) owns how hosts reach
+employees. The rest of the Nuhuo half lives in
 [Nuhuo's integration design](../../nuhuo/docs/paseo-integration-design.md); its release, variant, and
 mode-ID rules still apply, and its import model predates this version.
 
@@ -69,26 +73,27 @@ mode-ID rules still apply, and its import model predates this version.
 
 ## 3. Governance boundaries
 
-Because the employee controls their hosts, put every rule that must hold outside them. The plugin
+Because the employee controls the account their daemon runs as, put every rule that must hold
+outside it. The plugin
 sets defaults and makes the Worker experience the normal path; it is not a security boundary.
 
-| Control                                                             | Enforced by                                              | Holds if the employee tampers with a host |
-| ------------------------------------------------------------------- | -------------------------------------------------------- | ----------------------------------------- |
-| Spend and model access of an API key                                | The provider account that issued the key                 | Yes                                       |
-| Network egress                                                      | IT's network policy for the host                         | Yes                                       |
-| Access to a host                                                    | IT stops or wipes it                                     | Yes                                       |
-| Provider kinds, Roles, and models offered in Nuhuo                  | Nuhuo's forms                                            | No                                        |
-| Role, Skills, MCP, provider, model, and starting mode of each agent | Plugin hooks                                             | No                                        |
-| Usage records                                                       | The provider account; the phase 1 plugin reports nothing | Yes                                       |
+| Control                                                             | Enforced by                                               | Holds if the employee tampers with a host |
+| ------------------------------------------------------------------- | --------------------------------------------------------- | ----------------------------------------- |
+| Spend and model access of an API key                                | The provider account that issued the key                  | Yes                                       |
+| Network egress                                                      | IT's network policy for the host                          | Yes                                       |
+| Access to a host                                                    | IT reclaims it in Nuhuo's inventory, or stops or wipes it | Yes                                       |
+| Provider kinds, Roles, and models offered in Nuhuo                  | Nuhuo's forms                                             | No                                        |
+| Role, Skills, MCP, provider, model, and starting mode of each agent | Plugin hooks                                              | No                                        |
+| Usage records                                                       | The provider account; the phase 1 plugin reports nothing  | Yes                                       |
 
 Never label plugin-applied settings as enforced in the UI. Show them as the Worker's configuration.
 
 With employees' own API keys, the company sets no spend or model limit. If it needs one, issue keys
 for a company gateway; employees enter those keys in Nuhuo the same way.
 
-Nuhuo holds every employee's API keys and an SSH key that reaches all their hosts. Encrypt both at
-rest. A Nuhuo compromise is a compromise of every linked host, so authenticating its service
-([§10](#10-nuhuo-dependencies)) is blocking.
+Nuhuo holds every employee's API keys and the management credentials that reach every host in its
+inventory. Encrypt both at rest. A Nuhuo compromise is a compromise of every host, so authenticating
+its service ([§10](#10-nuhuo-dependencies)) is blocking.
 
 Linking an employee's hosts makes them one trust domain. Code running on one host can read the
 pairing offers of the others and drive them as owner. Never link hosts that belong to different
@@ -98,11 +103,11 @@ employees.
 
 ```mermaid
 flowchart LR
-  IT[IT engineer] -- clean hosts --> E[Employee]
-  X[AI experts] -- Roles, Skills, MCP --> N[Nuhuo Center]
-  E -- providers, Workers, link host --> N
-  N -- SSH: set up and repair --> H1
-  N -- SSH: set up and repair --> H2
+  IT[IT engineer] -- import hosts, allocate --> N[Nuhuo Center]
+  X[AI experts] -- Roles, Skills, MCP --> N
+  E[Employee] -- SSH keys, providers, Workers --> N
+  N -- set up, keys, reclaim --> H1
+  N -- set up, keys, reclaim --> H2
   subgraph H1[Employee host 1]
     D1[Paseo daemon] --> P1[nuhuo plugin]
   end
@@ -122,38 +127,36 @@ The plugin runs where the agents run. Hooks apply on the daemon that owns the ag
 stay up while the laptop sleeps. A plugin on the laptop would route the app through a daemon that
 stops when the lid closes.
 
-Nuhuo reaches a host over SSH to set it up and to repair or upgrade it. Providers, Workers, Skills,
-and secrets reach the host when the plugin pulls over HTTPS, so a settings change never needs SSH.
-The app reaches hosts only through the relay.
+Nuhuo reaches a host with its source's management credential, over SSH or the platform's API, to
+set it up, repair it, sync the employee's keys, and reclaim it. Providers, Workers, Skills, and
+secrets reach the host when the plugin pulls over HTTPS, so a settings change never needs that
+access. The app reaches hosts only through the relay.
 
 ## 5. Lifecycle
 
-### 5.1 Hand out a host
+### 5.1 Allocate hosts
 
-IT gives the employee a clean machine or VM with an account for them, SSH reachable from Nuhuo, and
-a network policy. IT installs nothing else and records nothing about the employee on the host.
+IT imports hardware, VPSes, and platform machines such as instabox into Nuhuo's
+[host inventory](../../nuhuo/docs/host-inventory-design.md), then allocates hosts by choosing an employee and a count.
+Nuhuo creates the employee's account on each host, installs their SSH public keys, and runs the setup
+below. The hosts appear on the employee's **My hosts** page in Nuhuo at once.
 
-### 5.2 Link a host
+### 5.2 Set up Paseo on a host
 
-The employee adds the public key from their Nuhuo profile to `~/.ssh/authorized_keys` on the host,
-then links the host in Nuhuo with its address and user. Nuhuo sets it up over SSH in this order and
-stops at the first failure:
+Nuhuo sets up Paseo as the employee's account, in this order, and stops at the first failure:
 
-1. Probe the OS and architecture with Nuhuo's existing host probe.
-2. Install Node, Paseo, and the agent CLIs on Nuhuo's supported list, such as Claude Code and Codex.
-3. Install a service that starts the daemon at boot and keeps it running after logout: a systemd user
-   unit with lingering on Linux, a LaunchAgent on macOS. Keep the daemon on loopback; the relay is the
-   only route in.
-4. Run `paseo daemon pair --relay --json`. Record the offer URL and the daemon's server ID on the host
+1. Install Node, Paseo, and the agent CLIs on Nuhuo's supported list, such as Claude Code and Codex.
+2. Install a service that starts the daemon at boot with nobody logged in: a systemd user unit with
+   lingering on Linux, a LaunchDaemon with `UserName` set to the account on macOS. A LaunchAgent would
+   wait for a desktop login. Keep the daemon on loopback; the relay is the only route in.
+3. Run `paseo daemon pair --relay --json`. Record the offer URL and the daemon's server ID on the host
    record, and issue a host token.
-5. Write the host credential ([§6.1](#61-host-credential)).
-6. Install the plugin with `paseo plugin add <path>`, set `pluginsEnabled` to `true`, and run
+4. Write the host credential ([§6.1](#61-host-credential)).
+5. Install the plugin with `paseo plugin add <path>`, set `pluginsEnabled` to `true`, and run
    `paseo reload`. Installed plugins stay off until that switch is on.
 
-Every step is idempotent: run setup again to repair or upgrade a host. Removing Nuhuo's key from
-`authorized_keys` after setup keeps the host working; Nuhuo can then no longer repair it.
-
-The plugin pulls as soon as it starts, so the host has the employee's providers within seconds.
+Every step is idempotent: the inventory runs setup again to repair or upgrade a host. The plugin
+pulls as soon as it starts, so the host has the employee's providers within seconds.
 
 ### 5.3 Create providers
 
@@ -178,14 +181,14 @@ one.
 
 ### 5.5 Enroll
 
-Nuhuo's enrollment page lists the employee's hosts, each with its offer as a link and QR code. The
+The employee's **My hosts** page in Nuhuo shows each host's offer as a link and QR code. The
 employee opens one in the Paseo app on their laptop, phone, or browser, once per device. The other
 hosts appear in the app routed through that host, because each host saves its peers
 ([§6.5](#65-peer-links)). Opening more links adds direct routes, so the app still reaches those hosts
 when the first one is down.
 
-Treat the page like a password: show it only to the signed-in employee, expire it after first view,
-and log who opened it.
+Treat an offer like a password: reveal it only to the signed-in owner, on request, and log each
+reveal.
 
 ### 5.6 Import and chat
 
@@ -227,9 +230,11 @@ agents pick it up on their next open ([§6.6](#66-releases-and-existing-agents))
 applies at each agent's next launch or resume. Deleting a Worker stops its agents from opening;
 deleting a provider removes its profile.
 
-To take a host back, IT wipes it; the employee's other hosts drop the link at their next pull. To
-offboard an employee, IT wipes their hosts and Nuhuo revokes their SSH key and host tokens. A new
-offer requires running setup again, because phase 1 cannot revoke a paired device.
+To take a host back, IT reclaims it in the inventory, which revokes its token and removes the
+employee's account or the machine ([host inventory §5.5](../../nuhuo/docs/host-inventory-design.md#55-reclaim)). Removing
+the account deletes the daemon, so every paired device loses access. The employee's other hosts drop
+the link at their next pull. To offboard an employee, IT reclaims all their hosts and Nuhuo deletes
+their providers and SSH keys.
 
 ## 6. Contract with Nuhuo
 
@@ -444,7 +449,7 @@ values never do.
 
 ## 8. Phase 1 limits
 
-- The employee is `owner` of each host. They can disable the plugin, edit its files, or change an
+- The employee is `owner` of each host's daemon. They can disable the plugin, edit its files, or change an
   agent's metadata. [§3](#3-governance-boundaries) lists what still holds.
 - A running agent's model, mode, and thinking can change without a check.
 - Withdrawal reaches a running agent at its next open; turns on an open agent continue.
@@ -476,38 +481,37 @@ fields optional. The plugin checks the features once and keeps phase 1 behavior 
 
 ## 10. Nuhuo dependencies
 
-| Item                                                                                                                                                               | Status                                                                                 |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| Authenticate the service before exposing it beyond loopback ([Nuhuo §3](../../nuhuo/docs/paseo-integration-design.md#3-prerequisite-authenticate-the-service-n00)) | Blocking: Nuhuo holds API keys and SSH access, and hosts call it over the network      |
-| Accounts for experts and employees, with employee sign-in                                                                                                          | New                                                                                    |
-| One SSH key pair per employee, shown as a public key on their profile                                                                                              | New                                                                                    |
-| Linking a host and running setup over SSH ([§5.2](#52-link-a-host))                                                                                                | Extends the host probe and `HostEntry`, which already has SSH fields and `pairingLink` |
-| Employee providers with encrypted API keys                                                                                                                         | New                                                                                    |
-| Worker form limited by expert policy and the host's inventory                                                                                                      | Extends `WorkerMetadata` (`hostId`, `agent`, `model`, `mode`, `thinking`, `workDir`)   |
-| Host API ([§6.2](#62-catalog)) and Skill archives addressed by digest                                                                                              | New                                                                                    |
-| Releases with a verified `paseo` variant                                                                                                                           | Specified in Nuhuo §5                                                                  |
-| Enrollment page listing the employee's hosts                                                                                                                       | New                                                                                    |
+| Item                                                                                                                                                               | Status                                                                                                          |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Authenticate the service before exposing it beyond loopback ([Nuhuo §3](../../nuhuo/docs/paseo-integration-design.md#3-prerequisite-authenticate-the-service-n00)) | Blocking: Nuhuo holds API keys and the management credentials of every host, and hosts call it over the network |
+| Accounts with IT, expert, and employee roles, and sign-in                                                                                                          | New                                                                                                             |
+| [Host inventory](../../nuhuo/docs/host-inventory-design.md): sources, import, allocation, accounts and SSH keys, **My hosts**, reclaim                             | Extends the host probe and `HostEntry`, which already has SSH fields and `pairingLink`                          |
+| Paseo setup run by the inventory ([§5.2](#52-set-up-paseo-on-a-host))                                                                                              | New                                                                                                             |
+| Employee providers with encrypted API keys                                                                                                                         | New                                                                                                             |
+| Worker form limited by expert policy and the host's inventory                                                                                                      | Extends `WorkerMetadata` (`hostId`, `agent`, `model`, `mode`, `thinking`, `workDir`)                            |
+| Host API ([§6.2](#62-catalog)) and Skill archives addressed by digest                                                                                              | New                                                                                                             |
+| Releases with a verified `paseo` variant                                                                                                                           | Specified in Nuhuo §5                                                                                           |
 
 ## 11. Verification
 
-| Case                              | Expected                                                                                           |
-| --------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Link a clean host                 | Daemon running as a boot service with the plugin enabled; running setup again changes nothing      |
-| Provider created or deleted       | `nuhuo-` profile added with its key or removed; other profiles untouched; inventory posted         |
-| Create with a Worker on this host | Saved provider/model/mode/thinking match the release; binding metadata written                     |
-| Create with another host's Worker | Rejected, naming the Worker and its host                                                           |
-| Create with an unknown Worker     | One pull; applied if the new catalog has it, rejected otherwise                                    |
-| Create without a Worker           | Default applied, rejected, or ordinary according to [§6.3](#63-applying-a-release)                 |
-| Overrides                         | Allowed field keeps the caller's value; other fields take the release's                            |
-| Open                              | Role appended, MCP, env, and tools added, secrets resolved from files and absent from saved config |
-| Skills                            | Archive digest checked, unsafe archives refused, files under `skills/<id>/<version>/`              |
-| Worker deleted or moved           | Interactive open blocked with the Worker named; history open works                                 |
-| Catalog missing, invalid, expired | New agents and interactive opens blocked; a failed pull keeps the last good catalog                |
-| Peer links                        | Added, updated, and removed to match the catalog; employee-added and disabled links untouched      |
-| Enroll through one host           | The employee's other hosts appear in the app as routed hosts                                       |
-| Chat                              | Agent created on the Worker's host in its working directory and opened                             |
-| Delegate                          | Child in the parent's Subagents track; finish notification after `send_agent_prompt`               |
-| Picker                            | Draft, New workspace, and running-agent composers on iOS, Android, browser, and Electron           |
+| Case                              | Expected                                                                                                                   |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Allocate a host                   | Daemon running as a boot service under the employee's account with the plugin enabled; running setup again changes nothing |
+| Provider created or deleted       | `nuhuo-` profile added with its key or removed; other profiles untouched; inventory posted                                 |
+| Create with a Worker on this host | Saved provider/model/mode/thinking match the release; binding metadata written                                             |
+| Create with another host's Worker | Rejected, naming the Worker and its host                                                                                   |
+| Create with an unknown Worker     | One pull; applied if the new catalog has it, rejected otherwise                                                            |
+| Create without a Worker           | Default applied, rejected, or ordinary according to [§6.3](#63-applying-a-release)                                         |
+| Overrides                         | Allowed field keeps the caller's value; other fields take the release's                                                    |
+| Open                              | Role appended, MCP, env, and tools added, secrets resolved from files and absent from saved config                         |
+| Skills                            | Archive digest checked, unsafe archives refused, files under `skills/<id>/<version>/`                                      |
+| Worker deleted or moved           | Interactive open blocked with the Worker named; history open works                                                         |
+| Catalog missing, invalid, expired | New agents and interactive opens blocked; a failed pull keeps the last good catalog                                        |
+| Peer links                        | Added, updated, and removed to match the catalog; employee-added and disabled links untouched                              |
+| Enroll through one host           | The employee's other hosts appear in the app as routed hosts                                                               |
+| Chat                              | Agent created on the Worker's host in its working directory and opened                                                     |
+| Delegate                          | Child in the parent's Subagents track; finish notification after `send_agent_prompt`                                       |
+| Picker                            | Draft, New workspace, and running-agent composers on iOS, Android, browser, and Electron                                   |
 
 `nuhuo-plugin/server/policy.test.ts` covers the version 3 decision tables, bundle states, and secret
 files. Hook wiring, provider profiles, peer links, delegation, and the screens need an
