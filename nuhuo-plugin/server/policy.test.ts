@@ -1,262 +1,287 @@
-import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { PluginHookRequests } from "@getpaseo/plugin/server";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BINDING_KEY, WORKER_CHOICE_KEY, type HostBundle } from "../shared/bundle";
-import { BundleStore, parseBundle } from "./bundle-store";
-import {
-  applyWorkerOnCreate,
-  contributeOnOpen,
-  NuhuoPolicyError,
-  type OpenRequest,
-} from "./policy";
-import { createSecretReader } from "./secrets";
+import type {
+  AgentToolDefinition,
+  PluginHookRequests,
+  PluginSessionOpenRequest,
+} from "@getpaseo/plugin/server";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { BINDING_KEY, WORKER_CHOICE_KEY, type HostCatalog } from "../shared/catalog";
+import { ensureInstructions, ensureSkill } from "./assets";
+import type { CatalogState } from "./catalog-store";
+import { NuhuoPolicyError } from "./errors";
+import { applyWorkerOnCreate, contributeOnOpen } from "./policy";
+import { createSecretReader, writeSecrets } from "./secrets";
+import { INSTRUCTIONS, SKILL_FILES, SKILL_DIGEST, makeCatalog, makeRelease } from "./test-fixtures";
 
 type CreateRequest = PluginHookRequests["agent.create.before"];
 
-function bundle(overrides: Partial<HostBundle> = {}): HostBundle {
-  const parsed = parseBundle(
-    JSON.stringify({
-      schema: 1,
-      centerId: "center-1",
-      hostId: "host-ada",
-      employee: { id: "ada", displayName: "Ada" },
-      issuedAt: "2026-11-19T00:00:00Z",
-      requireWorker: true,
-      workers: [
-        {
-          workerId: "reviewer",
-          name: "Code reviewer",
-          releaseDigest: "sha256:aaa",
-          displayVersion: "1.2.0",
-          provider: "claude",
-          model: "opus",
-          modeId: "plan",
-          allowedOverrides: ["modeId"],
-          instructions: "You review code.",
-          mcpServers: {
-            tickets: {
-              type: "http",
-              url: "https://tickets.example.com/mcp",
-              secretHeaders: { Authorization: { secretRef: "tickets-token" } },
-            },
-          },
-          env: { TEAM: "platform" },
-          secretEnv: { GATEWAY_KEY: { secretRef: "gateway-key" } },
-        },
-        {
-          workerId: "builder",
-          name: "Builder",
-          releaseDigest: "sha256:bbb",
-          displayVersion: "0.4.0",
-          provider: "codex",
-          instructions: "",
-        },
-      ],
-    }),
-  );
-  if (!parsed.ok) throw new Error(parsed.detail);
-  return { ...parsed.bundle, ...overrides };
+function ready(catalog: HostCatalog): () => Promise<CatalogState> {
+  return async () => ({ state: "ready", path: "catalog.json", catalog });
 }
 
 function createRequest(
   config: Partial<CreateRequest["config"]>,
   metadata: CreateRequest["metadata"] = {},
 ): CreateRequest {
-  return { config: { provider: "claude", cwd: "/repo", ...config }, metadata };
+  return { config: { provider: "claude", cwd: "/srv/app", ...config }, metadata };
 }
 
-function openRequest(overrides: Partial<OpenRequest> = {}): OpenRequest {
-  return {
-    agentId: "agent-1",
-    workspaceId: "workspace-1",
-    provider: "claude",
-    cwd: "/repo",
-    reason: "resume",
-    purpose: "interactive",
-    title: null,
-    background: false,
-    labels: {},
-    metadata: {
-      [BINDING_KEY]: {
-        centerId: "center-1",
-        workerId: "reviewer",
-        workerName: "Code reviewer",
-        releaseDigest: "sha256:aaa",
-      },
-    },
-    tools: [],
-    env: { EXISTING: "1" },
-    mcpServers: {},
-    ...overrides,
-  };
-}
+const noRefresh = async () => {
+  throw new Error("Unexpected pull");
+};
 
-const secrets: Record<string, string> = { "tickets-token": "Bearer t", "gateway-key": "k" };
-async function readSecret(name: string) {
-  const value = secrets[name];
-  if (value === undefined) throw new NuhuoPolicyError(`missing ${name}`);
-  return value;
-}
-
-describe("applyWorkerOnCreate", () => {
-  it("applies the chosen Worker and records the binding", () => {
-    const result = applyWorkerOnCreate(
-      bundle(),
-      createRequest(
-        { provider: "codex", model: "gpt-5.5", providerOptions: { plan_mode: true } },
-        { [WORKER_CHOICE_KEY]: "reviewer", other: 1 },
+describe("agent.create.before", () => {
+  it("applies the chosen Worker's launch settings and records the binding", async () => {
+    const result = await applyWorkerOnCreate({
+      request: createRequest(
+        { provider: "codex", model: "gpt-5", modeId: "full-access", providerOptions: { a: 1 } },
+        { [WORKER_CHOICE_KEY]: "reviewer", [BINDING_KEY]: { forged: true } },
       ),
-    );
+      readCatalog: ready(makeCatalog()),
+      refresh: noRefresh,
+    });
+
     expect(result.config).toEqual({
-      provider: "claude",
-      cwd: "/repo",
-      model: "opus",
-      modeId: "plan",
+      provider: "nuhuo-claude",
+      cwd: "/srv/app",
+      model: "claude-sonnet-4-5",
+      modeId: "default",
+      thinkingOptionId: "high",
     });
     expect(result.metadata).toEqual({
-      other: 1,
       [BINDING_KEY]: {
-        centerId: "center-1",
         workerId: "reviewer",
         workerName: "Code reviewer",
-        releaseDigest: "sha256:aaa",
+        releaseDigest: makeRelease().digest,
       },
     });
   });
 
-  it("keeps an allowed override on the same provider and replaces the others", () => {
-    const result = applyWorkerOnCreate(
-      bundle(),
-      createRequest(
-        { model: "sonnet", modeId: "acceptEdits" },
+  it("keeps the caller's value only for fields the release allows on the same provider", async () => {
+    const result = await applyWorkerOnCreate({
+      request: createRequest(
+        { provider: "nuhuo-claude", model: "other", modeId: "plan", thinkingOptionId: "low" },
         { [WORKER_CHOICE_KEY]: "reviewer" },
       ),
-    );
-    expect(result.config.model).toBe("opus");
-    expect(result.config.modeId).toBe("acceptEdits");
-  });
-
-  it("uses the default Worker when none is chosen", () => {
-    const result = applyWorkerOnCreate(
-      bundle({ defaultWorkerId: "builder" }),
-      createRequest({ model: "opus" }),
-    );
-    expect(result.config).toEqual({ provider: "codex", cwd: "/repo" });
-    expect(result.metadata?.[BINDING_KEY]).toMatchObject({ workerId: "builder" });
-  });
-
-  it("rejects an agent without a Worker when the host requires one", () => {
-    expect(() => applyWorkerOnCreate(bundle(), createRequest({}))).toThrow(
-      "Choose a Nuhuo Worker for this agent.",
-    );
-  });
-
-  it("leaves an ordinary agent ordinary and strips a forged binding", () => {
-    const result = applyWorkerOnCreate(
-      bundle({ requireWorker: false }),
-      createRequest({ model: "sonnet" }, { [BINDING_KEY]: { workerId: "reviewer" } }),
-    );
-    expect(result.config).toEqual({ provider: "claude", cwd: "/repo", model: "sonnet" });
-    expect(result.metadata).toEqual({});
-  });
-
-  it("rejects a Worker that is not assigned", () => {
-    expect(() =>
-      applyWorkerOnCreate(bundle(), createRequest({}, { [WORKER_CHOICE_KEY]: "intruder" })),
-    ).toThrow('Worker "intruder" is not assigned to this host.');
-  });
-});
-
-describe("contributeOnOpen", () => {
-  it("adds the Role, MCP servers, and resolved secrets", async () => {
-    const result = await contributeOnOpen({ bundle: bundle(), request: openRequest(), readSecret });
-    expect(result?.appendSystemPrompt).toEqual(["You review code."]);
-    expect(result?.env).toEqual({ EXISTING: "1", TEAM: "platform", GATEWAY_KEY: "k" });
-    expect(result?.mcpServers).toEqual({
-      tickets: {
-        type: "http",
-        url: "https://tickets.example.com/mcp",
-        headers: { Authorization: "Bearer t" },
-      },
+      readCatalog: ready(makeCatalog()),
+      refresh: noRefresh,
     });
+
+    expect(result.config.model).toBe("claude-sonnet-4-5");
+    expect(result.config.modeId).toBe("plan");
+    expect(result.config.thinkingOptionId).toBe("high");
   });
 
-  it("blocks a Worker that is no longer assigned", async () => {
-    const assigned = bundle();
-    const withoutReviewer = { ...assigned, workers: assigned.workers.slice(1) };
+  it("rejects a Worker on another host and names that host", async () => {
     await expect(
-      contributeOnOpen({ bundle: withoutReviewer, request: openRequest(), readSecret }),
-    ).rejects.toThrow('Worker "Code reviewer" is no longer assigned to this host.');
-  });
-
-  it("blocks a Worker whose release moved to another provider", async () => {
-    await expect(
-      contributeOnOpen({
-        bundle: bundle(),
-        request: openRequest({ provider: "codex" }),
-        readSecret,
+      applyWorkerOnCreate({
+        request: createRequest({}, { [WORKER_CHOICE_KEY]: "writer" }),
+        readCatalog: ready(makeCatalog()),
+        refresh: noRefresh,
       }),
-    ).rejects.toThrow('Worker "Code reviewer" now runs on claude.');
+    ).rejects.toThrow('Worker "Docs writer" runs on build-b. Start it on that host.');
   });
 
-  it("blocks an unbound agent only when the host requires Workers", async () => {
-    const unbound = openRequest({ metadata: {} });
-    await expect(
-      contributeOnOpen({ bundle: bundle(), request: unbound, readSecret }),
-    ).rejects.toThrow("This agent was not started as a Nuhuo Worker");
-    await expect(
-      contributeOnOpen({ bundle: bundle({ requireWorker: false }), request: unbound, readSecret }),
-    ).resolves.toBeUndefined();
+  it("pulls once for a Worker it has not heard of, then applies it", async () => {
+    let catalog = makeCatalog({ workers: [] });
+    const refresh = vi.fn(async () => {
+      catalog = makeCatalog();
+    });
+
+    const result = await applyWorkerOnCreate({
+      request: createRequest({}, { [WORKER_CHOICE_KEY]: "reviewer" }),
+      readCatalog: async () => ({ state: "ready", path: "catalog.json", catalog }),
+      refresh,
+    });
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(result.config.provider).toBe("nuhuo-claude");
   });
 
-  it("blocks when a secret is missing", async () => {
+  it("rejects a Worker still unknown after the pull", async () => {
     await expect(
-      contributeOnOpen({
-        bundle: bundle(),
-        request: openRequest(),
-        readSecret: async (name) => (name === "gateway-key" ? "k" : readSecret("absent")),
+      applyWorkerOnCreate({
+        request: createRequest({}, { [WORKER_CHOICE_KEY]: "ghost" }),
+        readCatalog: ready(makeCatalog()),
+        refresh: async () => {},
       }),
-    ).rejects.toThrow("missing absent");
+    ).rejects.toThrow('Worker "ghost" is not one of your Workers on this host.');
+  });
+
+  it("applies the default Worker, requires one when the host does, and otherwise stays ordinary", async () => {
+    const withDefault = await applyWorkerOnCreate({
+      request: createRequest({}),
+      readCatalog: ready(makeCatalog({ defaultWorkerId: "reviewer" })),
+      refresh: noRefresh,
+    });
+    expect(withDefault.config.provider).toBe("nuhuo-claude");
+
+    await expect(
+      applyWorkerOnCreate({
+        request: createRequest({}),
+        readCatalog: ready(makeCatalog({ policy: { requireWorker: true } })),
+        refresh: noRefresh,
+      }),
+    ).rejects.toBeInstanceOf(NuhuoPolicyError);
+
+    const ordinary = await applyWorkerOnCreate({
+      request: createRequest({ provider: "codex" }, { [BINDING_KEY]: { forged: true } }),
+      readCatalog: ready(makeCatalog()),
+      refresh: noRefresh,
+    });
+    expect(ordinary).toEqual(createRequest({ provider: "codex" }));
+  });
+
+  it("blocks creation while the catalog is expired", async () => {
+    await expect(
+      applyWorkerOnCreate({
+        request: createRequest({}),
+        readCatalog: async () => ({ state: "expired", path: "catalog.json", message: "Expired." }),
+        refresh: noRefresh,
+      }),
+    ).rejects.toThrow("Expired.");
   });
 });
 
-describe("bundle files and secrets", () => {
-  let directory: string;
+describe("agent.open.before", () => {
+  let home: string;
+  const tool: AgentToolDefinition = {
+    name: "nuhuo_list_workers",
+    description: "Lists Workers",
+    input: z.object({}),
+    execute: () => ({ text: "" }),
+  };
 
   beforeEach(async () => {
-    directory = await mkdtemp(path.join(os.tmpdir(), "nuhuo-plugin-"));
+    home = await mkdtemp(path.join(os.tmpdir(), "nuhuo-open-"));
   });
 
   afterEach(async () => {
-    await rm(directory, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
   });
 
-  it("reports missing, invalid, expired, and ready bundles", async () => {
-    const file = path.join(directory, "host-bundle.json");
-    const store = new BundleStore(file, () => new Date("2026-11-20T00:00:00Z"));
-    expect((await store.read()).state).toBe("missing");
+  function paths() {
+    return {
+      instructions: path.join(home, "instructions"),
+      skills: path.join(home, "skills"),
+      secrets: path.join(home, "secrets"),
+    };
+  }
 
-    await writeFile(file, JSON.stringify({ schema: 1 }));
-    const invalid = await store.read();
-    expect(invalid.state).toBe("invalid");
+  async function installWorkerFiles() {
+    const release = makeRelease();
+    const fetchAsset = async (digest: string) =>
+      digest === SKILL_DIGEST
+        ? { digest, kind: "skill", name: "review", version: "1.0.0", files: SKILL_FILES }
+        : { digest, kind: "instructions", name: "reviewer.md", content: INSTRUCTIONS };
+    await ensureInstructions({ directory: paths().instructions, release, fetchAsset });
+    await ensureSkill({ directory: paths().skills, skill: release.skills[0]!, fetchAsset });
+    await writeSecrets(paths().secrets, { "github-token": "ghp_1", "tracker-token": "Bearer t" });
+  }
 
-    const valid = bundle();
-    await writeFile(file, JSON.stringify({ ...valid, expiresAt: "2026-11-19T12:00:00Z" }));
-    await utimes(file, new Date(), new Date(Date.now() + 5_000));
-    expect((await store.read()).state).toBe("expired");
+  function openRequest(
+    overrides: Partial<PluginSessionOpenRequest> = {},
+  ): PluginSessionOpenRequest {
+    return {
+      agentId: "agent_1",
+      workspaceId: null,
+      provider: "nuhuo-claude",
+      cwd: "/srv/app",
+      reason: "resume",
+      purpose: "interactive",
+      title: null,
+      background: false,
+      labels: {},
+      metadata: {
+        [BINDING_KEY]: { workerId: "reviewer", workerName: "Code reviewer", releaseDigest: "x" },
+      },
+      tools: [],
+      env: { EXISTING: "1" },
+      mcpServers: {},
+      ...overrides,
+    };
+  }
 
-    await writeFile(file, JSON.stringify(valid));
-    await utimes(file, new Date(), new Date(Date.now() + 10_000));
-    expect((await store.read()).state).toBe("ready");
+  it("adds the Worker's instructions, Skill paths, environment, secrets, MCP servers, and tools", async () => {
+    await installWorkerFiles();
+    const result = await contributeOnOpen({
+      catalog: makeCatalog(),
+      request: openRequest(),
+      readSecret: createSecretReader(paths().secrets),
+      paths: paths(),
+      tools: [tool],
+    });
+
+    expect(result.env).toEqual({ EXISTING: "1", REVIEW_DEPTH: "full", GITHUB_TOKEN: "ghp_1" });
+    expect(result.mcpServers).toEqual({
+      tracker: {
+        type: "http",
+        url: "https://tracker.example.com/mcp",
+        headers: { Authorization: "Bearer t", "X-Team": "core" },
+      },
+    });
+    expect(result.tools).toEqual([tool]);
+    expect(result.appendSystemPrompt).toEqual([
+      `# Reviewer\r\nReview carefully.\n\n## Skill files on this host\n- review 1.0.0: ${path.join(home, "skills", "review", "1.0.0")}`,
+    ]);
   });
 
-  it("reads secrets from files and rejects missing ones", async () => {
-    await writeFile(path.join(directory, "gateway-key"), "k\n");
-    const reader = createSecretReader(directory);
-    await expect(reader("gateway-key")).resolves.toBe("k");
-    await expect(reader("absent")).rejects.toThrow('Secret "absent" is missing on this host.');
-    await expect(reader("../escape")).rejects.toThrow('Secret "../escape" has an invalid name.');
+  it("blocks a Worker that left this host, changed provider, or lacks its Skill", async () => {
+    const readSecret = createSecretReader(paths().secrets);
+    await expect(
+      contributeOnOpen({
+        catalog: makeCatalog({ workers: [] }),
+        request: openRequest(),
+        readSecret,
+        paths: paths(),
+        tools: [],
+      }),
+    ).rejects.toThrow('Worker "Code reviewer" is no longer on this host.');
+
+    await expect(
+      contributeOnOpen({
+        catalog: makeCatalog(),
+        request: openRequest({ provider: "claude" }),
+        readSecret,
+        paths: paths(),
+        tools: [],
+      }),
+    ).rejects.toThrow("now runs on provider nuhuo-claude");
+
+    await expect(
+      contributeOnOpen({
+        catalog: makeCatalog(),
+        request: openRequest(),
+        readSecret,
+        paths: paths(),
+        tools: [],
+      }),
+    ).rejects.toThrow('Skill "review" of Worker "Code reviewer" has not reached this host.');
+  });
+
+  it("gives an ordinary agent the tools, and blocks it when the host requires Workers", async () => {
+    const readSecret = createSecretReader(paths().secrets);
+    const ordinary = await contributeOnOpen({
+      catalog: makeCatalog(),
+      request: openRequest({ metadata: {} }),
+      readSecret,
+      paths: paths(),
+      tools: [tool],
+    });
+    expect(ordinary.tools).toEqual([tool]);
+    expect(ordinary.appendSystemPrompt).toBeUndefined();
+
+    await expect(
+      contributeOnOpen({
+        catalog: makeCatalog({ policy: { requireWorker: true } }),
+        request: openRequest({ metadata: {} }),
+        readSecret,
+        paths: paths(),
+        tools: [tool],
+      }),
+    ).rejects.toThrow("not started as a Nuhuo Worker");
   });
 });

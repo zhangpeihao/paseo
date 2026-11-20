@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { useComposer } from "@getpaseo/plugin/client";
 import { Select } from "@getpaseo/plugin/client/ui";
-import { BINDING_KEY, WORKER_CHOICE_KEY, bindingSchema } from "../shared/bundle";
+import { BINDING_KEY, WORKER_CHOICE_KEY, bindingSchema } from "../shared/catalog";
 import type { WorkerSummary } from "../shared/rpc";
 import { useHostStatus } from "./use-host-status";
 
@@ -17,15 +17,18 @@ interface WorkerOption {
 function ignoreChange() {}
 
 /**
- * Chooses the Worker for a new agent and shows the bound Worker on a running one. The create hook
- * applies the release again on the daemon; this control only shows the choice before submit.
+ * Chooses one of this host's Workers for a new agent and shows the bound Worker on a running one.
+ * The create hook applies the release again on the daemon; this control only shows the choice.
  */
 export function WorkerPicker() {
   const composer = useComposer();
   const { state } = useHostStatus();
   const host = state.status === "ready" ? state.host : null;
   const readyHost = host?.state === "ready" ? host : null;
-  const workers = readyHost?.workers ?? NO_WORKERS;
+  const workers = useMemo(
+    () => readyHost?.workers.filter((worker) => worker.onThisHost) ?? NO_WORKERS,
+    [readyHost],
+  );
   const { metadata } = composer.agent;
 
   const binding = useMemo(() => {
@@ -44,7 +47,7 @@ export function WorkerPicker() {
   const unavailableOptions = useMemo<WorkerOption[]>(
     () =>
       host !== null && host.state !== "ready"
-        ? [{ value: NO_WORKER, label: "Nuhuo unavailable", description: host.message }]
+        ? [{ value: NO_WORKER, label: "Nuhuo settings unavailable", description: host.message }]
         : [],
     [host],
   );
@@ -55,7 +58,10 @@ export function WorkerPicker() {
       value: worker.workerId,
       label:
         worker.workerId === readyHost.defaultWorkerId ? `${worker.name} (default)` : worker.name,
-      description: worker.description ?? `${worker.displayVersion} · ${worker.provider}`,
+      description: [
+        worker.roleId,
+        worker.model === "" ? worker.providerId : `${worker.providerId}/${worker.model}`,
+      ].join(" · "),
     }));
     if (!readyHost.requireWorker) {
       options.unshift({
@@ -67,7 +73,7 @@ export function WorkerPicker() {
       options.unshift({
         value: NO_WORKER,
         label: "Choose a Worker",
-        description: "This host runs only the Workers assigned to you.",
+        description: "This host runs only your Workers.",
       });
     }
     return options;
@@ -80,12 +86,12 @@ export function WorkerPicker() {
         return;
       }
       const worker = workers.find((candidate) => candidate.workerId === next);
-      if (!worker) throw new Error(`Worker "${next}" is not assigned to this host.`);
+      if (!worker) throw new Error(`Worker "${next}" is not on this host.`);
       await composer.setMetadata({ [WORKER_CHOICE_KEY]: worker.workerId });
-      if (composer.agent.provider !== worker.provider) {
-        await composer.setProvider(worker.provider);
+      if (composer.agent.provider !== worker.providerId) {
+        await composer.setProvider(worker.providerId);
       }
-      if (worker.model !== undefined) await composer.setModel(worker.model);
+      if (worker.model !== "") await composer.setModel(worker.model);
       if (worker.modeId !== undefined) await composer.setMode(worker.modeId);
       if (worker.thinkingOptionId !== undefined) {
         await composer.setThinking(worker.thinkingOptionId);

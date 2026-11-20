@@ -1,11 +1,11 @@
 # Nuhuo enterprise plugin design
 
-Status: proposed, version 6, 19 November 2026. The code in [`nuhuo-plugin/`](../nuhuo-plugin/)
-implements version 3 (one host per employee, a bundle pushed to the host); [§7](#7-plugin-phase-1)
-lists what changes. Phase 2 is not started.
+Status: version 6, 20 November 2026. [`nuhuo-plugin/`](../nuhuo-plugin/) implements phase 1
+against Nuhuo's host API; [§10](#10-nuhuo-dependencies) lists what Nuhuo still lacks. Phase 2 is not
+started.
 
-Source baseline: Paseo `02124454b`; Nuhuo `5ac4631`. Proposed types and APIs below are contracts
-unless this doc names the file that implements them.
+Source baseline: Paseo `02124454b` with plugin SDK `0.17.0-beta.1`; Nuhuo `676adcc` on
+`paseo-catalog-peers`, which adds peer hosts and Workers to `main` at `cd0b393`.
 
 ## 1. Outcome
 
@@ -148,8 +148,9 @@ Nuhuo sets up Paseo as the employee's account, in this order, and stops at the f
 2. Install a service that starts the daemon at boot with nobody logged in: a systemd user unit with
    lingering on Linux, a LaunchDaemon with `UserName` set to the account on macOS. A LaunchAgent would
    wait for a desktop login. Keep the daemon on loopback; the relay is the only route in.
-3. Run `paseo daemon pair --relay --json`. Record the offer URL and the daemon's server ID on the host
-   record, and issue a host token.
+3. Run `paseo daemon pair --relay --json` and return the offer URL as the setup step's
+   `connectionToken`. Nuhuo stores it encrypted and issues a host token. The daemon's server ID
+   arrives with the first inventory report.
 4. Write the host credential ([§6.1](#61-host-credential)).
 5. Install the plugin with `paseo plugin add <path>`, set `pluginsEnabled` to `true`, and run
    `paseo reload`. Installed plugins stay off until that switch is on.
@@ -240,7 +241,8 @@ their providers and SSH keys.
 ### 6.1 Host credential
 
 Setup writes `~/.nuhuo/paseo/host.json` with mode `0600`. Set `NUHUO_PASEO_HOME` in the daemon's
-environment to use another directory; the plugin process inherits it.
+environment to use another directory; the plugin process inherits it. The plugin keeps what it pulls
+beside it: `catalog.json`, `secrets/`, `instructions/`, and `skills/`.
 
 ```json
 { "centerUrl": "https://nuhuo.example.com", "hostId": "host_123", "token": "..." }
@@ -255,74 +257,32 @@ theirs.
 The plugin calls these endpoints under `{centerUrl}/api/paseo/v1/hosts/{hostId}` with
 `Authorization: Bearer <token>`:
 
-| Endpoint               | Returns or takes                                                                |
-| ---------------------- | ------------------------------------------------------------------------------- |
-| `GET /catalog`         | The `HostCatalog` below                                                         |
-| `GET /secrets`         | Values for every `secretRef` the catalog names for this host                    |
-| `GET /assets/{digest}` | A Skill archive                                                                 |
-| `PUT /inventory`       | The daemon's server ID, and each provider's models, modes, and thinking options |
+| Endpoint               | Returns or takes                                                                                    |
+| ---------------------- | --------------------------------------------------------------------------------------------------- |
+| `GET /catalog`         | The catalog below                                                                                   |
+| `GET /secrets`         | `{ secrets }`: the value of every `secretRef` the catalog names, keyed by reference                 |
+| `GET /assets/{digest}` | Instructions as `content`, or a Skill as `files` with path, mode, and base64 content or link target |
+| `PUT /inventory`       | Server ID, platform, and per provider kind the models, modes, and thinking options                  |
 
-It writes the catalog atomically to `catalog.json` beside the credential and decides from that file,
-so a failed pull keeps the last good catalog until it expires. The catalog carries no secret values.
+It writes the catalog atomically to `catalog.json` and decides from that file, so a failed pull keeps
+the last good catalog until it expires. The catalog carries no secret values.
 
-```ts
-type HostCatalog = {
-  schema: 2;
-  centerId: string;
-  hostId: string; // the host that pulled
-  employee: { id: string; displayName: string };
-  issuedAt: string;
-  expiresAt?: string;
-  requireWorker: boolean; // on this host
-  defaultWorkerId?: string; // a Worker on this host
-  providers: CatalogProvider[]; // every provider of the employee
-  hosts: EmployeeHost[]; // every host of the employee, this one included
-  workers: CatalogWorker[]; // every Worker of the employee, on any of their hosts
-};
+The plugin's schemas in [`nuhuo-plugin/shared/catalog.ts`](../nuhuo-plugin/shared/catalog.ts) are
+the contract; Nuhuo's `PaseoHostCatalog` in `src/core/types.ts` produces it. The catalog has:
 
-type CatalogProvider = {
-  providerId: string; // Paseo provider ID, always starting with "nuhuo-"
-  extends: string; // built-in Paseo provider: "claude", "codex", ...
-  label: string;
-  env: Record<string, string>; // non-secret values such as a base URL
-  secretEnv: Record<string, { secretRef: string }>; // the API key
-  models?: { id: string; label: string }[];
-};
+| Field                         | Holds                                                                                                                     |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `schema`                      | `1`                                                                                                                       |
+| `hostId`, `ownerId`, `digest` | The host that pulled, its owner, and a digest of everything below                                                         |
+| `issuedAt`, `expiresAt`       | Validity; IT sets the length, 7 days by default                                                                           |
+| `policy`                      | `requireWorker` for the company                                                                                           |
+| `providers`                   | Every provider of the employee: `nuhuo-` ID, kind, label, base URL, models, and the key as `{ secretRef }`                |
+| `workers`                     | This host's Worker releases: provider, `launch` settings and `allowedOverrides`, instructions digest, Skills, MCP servers |
+| `hosts`                       | Every ready host of the employee with server ID and offer, this one included                                              |
+| `peerWorkers`                 | The employee's Workers on their other hosts: name, Role, provider, model, and working directory                           |
+| `defaultWorkerId`             | Optional; Nuhuo does not send it yet                                                                                      |
 
-type EmployeeHost = {
-  hostId: string;
-  name: string;
-  serverId: string; // Paseo server ID of the host's daemon
-  connection: string; // relay pairing offer, used for peer links
-};
-
-type CatalogWorker = {
-  workerId: string;
-  hostId: string;
-  name: string;
-  description?: string;
-  roleName: string;
-  workDir: string; // absolute path on the Worker's host
-  provider: string; // a CatalogProvider ID
-  model?: string;
-  modeId?: string; // Paseo mode ID
-  thinkingOptionId?: string;
-  release?: WorkerRelease; // only for Workers on this host
-};
-
-type WorkerRelease = {
-  releaseDigest: string;
-  displayVersion: string;
-  allowedOverrides: ("model" | "modeId" | "thinkingOptionId")[];
-  instructions: string; // ROLE.md, profile instructions, and the Skill index with host paths
-  skills: { id: string; version: string; digest: string }[];
-  mcpServers: Record<string, McpServerTemplate>; // secrets as { secretRef }
-  env: Record<string, string>;
-  secretEnv: Record<string, { secretRef: string }>;
-};
-```
-
-Other hosts' Workers carry what listing and delegation need; each host applies its own releases.
+Each host applies only its own releases; `peerWorkers` carry what listing and delegation need.
 
 A missing, invalid, or expired catalog blocks new agents and interactive opens with a message naming
 the problem. History opens always proceed.
@@ -334,7 +294,7 @@ On `agent.create.before`:
 | Request                                                | Result                                            |
 | ------------------------------------------------------ | ------------------------------------------------- |
 | `metadata["nuhuo.worker"]` names a Worker on this host | Apply that release                                |
-| Names a Worker on another of the employee's hosts      | Reject, naming the Worker and its host            |
+| Names a Worker in `peerWorkers`                        | Reject, naming the Worker and its host            |
 | Names a Worker not in the catalog                      | Pull once within 10 seconds, then apply or reject |
 | No Worker, `defaultWorkerId` set                       | Apply the default release                         |
 | No Worker, no default, `requireWorker: true`           | Reject: choose a Worker                           |
@@ -344,20 +304,21 @@ The pull on an unknown Worker lets the employee chat with a Worker minutes after
 waiting for the next poll. It stays inside the 30-second hook timeout.
 
 Applying sets `provider` from the release. Provider changes reset the rest, so the release's model,
-mode, and thinking replace the request's. On the same provider, a field listed in `allowedOverrides`
+mode, and thinking replace the request's. On the same provider, a field `allowedOverrides` allows
 keeps the request's value and other fields take the release's. The plugin writes
-`metadata["nuhuo.binding"] = { centerId, workerId, workerName, releaseDigest }` and drops any binding
-the caller sent. It does not save the Role into `systemPrompt`.
+`metadata["nuhuo.binding"] = { workerId, workerName, releaseDigest }` and drops any binding the
+caller sent. It does not save the Role into `systemPrompt`, and it does not move the agent: **Chat**
+and `nuhuo_start_worker` create it in the release's `cwd`.
 
 On `agent.open.before` with `purpose: "interactive"`:
 
-| Agent                                          | Result                                                                              |
-| ---------------------------------------------- | ----------------------------------------------------------------------------------- |
-| Bound, Worker on this host, same provider      | Append `instructions`; add `mcpServers`, `env`, resolved secrets, and the two tools |
-| Bound, Worker deleted or moved to another host | Block: the Worker is no longer on this host                                         |
-| Bound, release moved to another provider       | Block: start a new agent for this Worker                                            |
-| Unbound, `requireWorker: true`                 | Block: covers imports and agents created before the plugin                          |
-| Unbound, `requireWorker: false`                | Add the two tools                                                                   |
+| Agent                                          | Result                                                                                      |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Bound, Worker on this host, same provider      | Append the instructions and Skill paths; add MCP servers, `env`, secrets, and the two tools |
+| Bound, Worker deleted or moved to another host | Block: the Worker is no longer on this host                                                 |
+| Bound, release moved to another provider       | Block: start a new agent for this Worker                                                    |
+| Unbound, `requireWorker: true`                 | Block: covers imports and agents created before the plugin                                  |
+| Unbound, `requireWorker: false`                | Add the two tools                                                                           |
 
 ### 6.4 Secrets and Skills
 
@@ -367,10 +328,12 @@ the catalog no longer names. Worker secrets are read at open time, so they never
 saved configuration or the catalog. A name containing a path separator or a missing file blocks the
 open.
 
-For each Skill a release lists, the plugin downloads the archive once, checks it against `digest`,
-and unpacks it to `skills/<id>/<version>/`. It refuses archives with absolute paths, `..`, links that
-leave the directory, or device files. A failed download blocks opens of that Worker until a pull
-succeeds.
+For each release, the plugin stores the instructions as `instructions/<digest>.md` and each Skill
+under `skills/<name>/<version>/`, with the digest it was checked against in `<version>.digest`. It
+recomputes Nuhuo's digest from the downloaded file list (sorted paths, modes, file hashes, and link
+targets; `nuhuo-plugin/server/digest.ts`) and refuses a mismatch, absolute paths, `..`, and links
+that leave the directory. A missing Skill or instructions file blocks opens of that Worker until a
+pull fetches it. At open, the plugin appends each Skill's path to the instructions.
 
 ### 6.5 Peer links
 
@@ -379,8 +342,10 @@ After each pull, the plugin reconciles the daemon's saved hosts with the catalog
 
 - Add each other host with its offer, its name as label, and source key `nuhuo:<hostId>`. Repeating an
   unchanged add returns the saved entry.
-- Update the connection when an offer changes. A host set up again from scratch has a new server ID;
-  remove its registration and add it again rather than replacing the identity.
+- Update the connection when an offer changes. The registration's `nuhuo.connection` metadata holds a
+  fingerprint of the offer, so a change shows without storing the offer twice.
+- A host set up again from scratch has a new server ID. Update it with `replaceIdentity: true`, which
+  keeps a link the employee disabled.
 - Remove registrations with a `nuhuo:` source key that the catalog no longer lists.
 - Leave registrations the employee added, and keep a link the employee disabled.
 
@@ -394,11 +359,14 @@ immutable binding of phase 2.
 
 ### 6.7 Providers
 
-After each pull, the plugin makes the daemon's `nuhuo-` provider profiles match the catalog with one
-`context.paseo.config.patch` call. `providers` sets `extends`, `label`, `models`, and `env` with the
-API key resolved from `secrets/`; `removeProviders` drops `nuhuo-` profiles the catalog no longer
-lists. The plugin patches only when something changed, then posts the inventory. It never touches
-profiles without the prefix, so the employee's own providers on the host stay as they are.
+After each pull, the plugin makes the daemon's `nuhuo-` provider profiles match the catalog through
+`context.paseo.config.patch`, and only when something changed. Each profile sets `extends` to the
+kind, `label`, `models` with the model ID as label, and `env` with the API key. A base URL goes in
+`ANTHROPIC_BASE_URL` for Claude and `OPENAI_BASE_URL` for Codex; another kind with a base URL is
+skipped and shown as a problem. `removeProviders` drops `nuhuo-` profiles the catalog no longer
+lists. A patch merges into the saved profile, so a profile that drops a variable or its model list
+is removed first and added again. The plugin never touches profiles without the prefix, so the
+employee's own providers on the host stay as they are.
 
 Paseo stores the keys in `config.json` in plain text. Every agent on the host can read them, as it
 can read any key in its environment.
@@ -411,25 +379,33 @@ the desktop build, and built-in IDs cannot be installed by path. It is not an np
 `npm run typecheck` skips it; run `npm install --legacy-peer-deps`, `npm run typecheck`, and
 `npm test` inside it.
 
-The plugin requires the first Paseo release after 0.16.2. `appendSystemPrompt` on
-`agent.open.before` landed in paseo#9781 and is in no 0.16.x release, so the manifest declares
-`>=0.17.0-0`. Correct the range if that change ships under another version.
+The plugin requires Paseo 0.17. `appendSystemPrompt` on `agent.open.before` landed in paseo#9781 and
+is in no 0.16.x release, so the manifest declares `>=0.17.0-0` and the plugin builds against SDK
+`0.17.0-beta.1`.
 
-| File                        | Responsibility                                                    | Change from version 3 code           |
-| --------------------------- | ----------------------------------------------------------------- | ------------------------------------ |
-| `shared/catalog.ts`         | Zod schemas for the credential, catalog, and binding              | Replaces `shared/bundle.ts`          |
-| `shared/rpc.ts`             | `nuhuo.status.get`, `nuhuo.catalog.import`, `nuhuo.workers.start` | Add the last two                     |
-| `server/catalog-store.ts`   | Read, validate, and cache the catalog                             | Replaces `server/bundle-store.ts`    |
-| `server/nuhuo-client.ts`    | Call the endpoints in [§6.2](#62-catalog), with timeouts          | New                                  |
-| `server/sync.ts`            | One pull: catalog, secrets, Skills, providers, peers, inventory   | New                                  |
-| `server/providers.ts`       | Reconcile `nuhuo-` provider profiles ([§6.7](#67-providers))      | New                                  |
-| `server/skills.ts`          | Download, verify, and unpack Skill archives                       | New                                  |
-| `server/peer-links.ts`      | Reconcile saved hosts ([§6.5](#65-peer-links))                    | New                                  |
-| `server/worker-tools.ts`    | `nuhuo_list_workers` and `nuhuo_start_worker`                     | New                                  |
-| `server/policy.ts`          | Decision tables in [§6.3](#63-applying-a-release)                 | Add host checks and the pull on miss |
-| `server/secrets.ts`         | Write and resolve secret files                                    | Add writing                          |
-| `client/workers-screen.tsx` | Nuhuo screen: import, providers, Workers by host, Chat            | Replaces `client/status-screen.tsx`  |
-| `client/worker-picker.tsx`  | Composer item: Worker `Select` for this host                      | Filter to this host's Workers        |
+Paseo gives a plugin its API only inside hooks and handlers. The pull at start writes files; the
+first hook or RPC hands the plugin the API, and that pull and every later one also reconcile
+providers and peer links and post the inventory. Opening the app's composer or the Nuhuo screen
+calls an RPC, so this happens as soon as the employee uses the host.
+
+| File                        | Responsibility                                                    |
+| --------------------------- | ----------------------------------------------------------------- |
+| `shared/catalog.ts`         | Zod schemas for the credential, catalog, assets, and binding      |
+| `shared/rpc.ts`             | `nuhuo.status.get`, `nuhuo.catalog.import`, `nuhuo.workers.start` |
+| `server/sync.ts`            | One pull: catalog, secrets, assets, providers, peers, inventory   |
+| `server/nuhuo-client.ts`    | The endpoints in [§6.2](#62-catalog), with timeouts               |
+| `server/catalog-store.ts`   | Read, validate, cache, and expire `catalog.json`                  |
+| `server/assets.ts`          | Instructions and Skills: download, verify, unpack                 |
+| `server/digest.ts`          | Nuhuo's digests, to verify downloads                              |
+| `server/secrets.ts`         | Write and read secret files                                       |
+| `server/providers.ts`       | Reconcile `nuhuo-` provider profiles ([§6.7](#67-providers))      |
+| `server/peer-links.ts`      | Reconcile saved hosts ([§6.5](#65-peer-links))                    |
+| `server/inventory.ts`       | Build the inventory report                                        |
+| `server/policy.ts`          | Decision tables in [§6.3](#63-applying-a-release)                 |
+| `server/start-worker.ts`    | Create an agent for a Worker on its host                          |
+| `server/worker-tools.ts`    | `nuhuo_list_workers` and `nuhuo_start_worker`                     |
+| `client/workers-screen.tsx` | Nuhuo screen: import, providers, Workers by host, Chat            |
+| `client/worker-picker.tsx`  | Composer item: Worker `Select` for this host                      |
 
 One pull runs at a time; an Import during a pull waits for it. **Chat** calls `nuhuo.workers.start` on
 the selected host. For a Worker on another host, the handler creates the agent through
@@ -458,6 +434,11 @@ values never do.
 - The app reaches routed hosts only while the host it enrolled through is online.
 - Native `create_agent` cannot name a Worker; agents delegate with `nuhuo_start_worker`.
 - API keys sit in Paseo's `config.json` in plain text ([§6.7](#67-providers)).
+- Providers, peer links, and the inventory wait for the first hook or RPC after the plugin starts
+  ([§7](#7-plugin-phase-1)).
+- A release's `tools` are not installed, and `allowedOverrides.cwd` is not checked: the create hook
+  leaves the working directory as the caller set it.
+- The inventory report has no Paseo version, because a plugin cannot read it.
 
 ## 9. Phase 2: core changes
 
@@ -469,6 +450,7 @@ values never do.
 | C4 Worker-aware creation             | Pass labels to `agent.create.before`, or let `create_agent` carry plugin metadata                                                                                          | Native `create_agent` starts a Worker in one step; `nuhuo_start_worker` retires             |
 | C5 Provider secrets                  | Provider `env` values that reference a secret file instead of plain text in `config.json`                                                                                  | API keys kept out of the daemon config                                                      |
 | C6 Shared hosts                      | Workspace-scoped grants with resource checks on every operation, and per-user OS isolation for agents and terminals                                                        | Several employees on one daemon                                                             |
+| C7 Plugin API at start               | Give `contribute()` the Paseo API that hooks and handlers receive                                                                                                          | Providers and peer links installed as soon as the daemon starts                             |
 
 C1 alone does not make governance hold: a `workspace.write` principal can still run code as the
 daemon user through an agent. Pair it with an agent runtime that cannot read daemon state, such as a
@@ -480,16 +462,17 @@ fields optional. The plugin checks the features once and keeps phase 1 behavior 
 
 ## 10. Nuhuo dependencies
 
-| Item                                                                                                                                                               | Status                                                                                                               |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| Authenticate the service before exposing it beyond loopback ([Nuhuo §3](../../nuhuo/docs/paseo-integration-design.md#3-prerequisite-authenticate-the-service-n00)) | N00. Blocking: Nuhuo holds API keys and the management credentials of every host, and hosts call it over the network |
-| Accounts with IT, expert, and employee roles, and sign-in ([Nuhuo §4](../../nuhuo/docs/paseo-integration-design.md#4-accounts-and-roles))                          | N01                                                                                                                  |
-| [Host inventory](../../nuhuo/docs/host-inventory-design.md): sources, import, allocation, accounts and SSH keys, **My hosts**, reclaim                             | N08; extends the host probe and `HostEntry`                                                                          |
-| Paseo setup run by the inventory ([§5.2](#52-set-up-paseo-on-a-host))                                                                                              | N08                                                                                                                  |
-| Employee providers and secrets, encrypted ([Nuhuo §5](../../nuhuo/docs/paseo-integration-design.md#5-providers-and-secrets))                                       | N05                                                                                                                  |
-| Worker form limited by Role policy and the host's inventory ([Nuhuo §6](../../nuhuo/docs/paseo-integration-design.md#6-workers-and-releases))                      | N02, N06; extends `WorkerMetadata`                                                                                   |
-| Host API ([§6.2](#62-catalog), [Nuhuo §7](../../nuhuo/docs/paseo-integration-design.md#7-host-api)) and Skill archives addressed by digest                         | N07                                                                                                                  |
-| Releases, Role publication checks, and a side-effect-free resolver ([Nuhuo §6.7](../../nuhuo/docs/paseo-integration-design.md#67-publication-checks))              | N03, N04                                                                                                             |
+Nuhuo `cd0b393` implements N00 to N10 of [its integration design](../../nuhuo/docs/paseo-integration-design.md):
+accounts and roles, employee providers and secrets, releases, the resolver, the host API, and the
+host inventory. `676adcc` adds `hosts`, `peerWorkers`, and all of the employee's providers to each
+catalog. Still missing:
+
+| Item                                                                                      | Effect until it lands                                                                                  |
+| ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| A setup adapter that runs [§5.2](#52-set-up-paseo-on-a-host) over SSH or the instabox API | `server.ts` builds the inventory without one, so allocation marks steps done without touching the host |
+| **My hosts** shows the relay offer                                                        | It shows a `paseo://connect` link built from the address and token, which the app cannot open          |
+| The employee's default Worker per host                                                    | No `defaultWorkerId`; agents without a Worker follow `requireWorker`                                   |
+| `PUT /inventory` without `paseoVersion`                                                   | Nuhuo records `6.0.0` for every host                                                                   |
 
 ## 11. Verification
 
@@ -503,7 +486,7 @@ fields optional. The plugin checks the features once and keeps phase 1 behavior 
 | Create without a Worker           | Default applied, rejected, or ordinary according to [§6.3](#63-applying-a-release)                                         |
 | Overrides                         | Allowed field keeps the caller's value; other fields take the release's                                                    |
 | Open                              | Role appended, MCP, env, and tools added, secrets resolved from files and absent from saved config                         |
-| Skills                            | Archive digest checked, unsafe archives refused, files under `skills/<id>/<version>/`                                      |
+| Skills                            | Digest checked against Nuhuo's, unsafe entries refused, files under `skills/<name>/<version>/`                             |
 | Worker deleted or moved           | Interactive open blocked with the Worker named; history open works                                                         |
 | Catalog missing, invalid, expired | New agents and interactive opens blocked; a failed pull keeps the last good catalog                                        |
 | Peer links                        | Added, updated, and removed to match the catalog; employee-added and disabled links untouched                              |
@@ -512,6 +495,7 @@ fields optional. The plugin checks the features once and keeps phase 1 behavior 
 | Delegate                          | Child in the parent's Subagents track; finish notification after `send_agent_prompt`                                       |
 | Picker                            | Draft, New workspace, and running-agent composers on iOS, Android, browser, and Electron                                   |
 
-`nuhuo-plugin/server/policy.test.ts` covers the version 3 decision tables, bundle states, and secret
-files. Hook wiring, provider profiles, peer links, delegation, and the screens need an
-[ad-hoc daemon](ad-hoc-daemon-testing.md) run with two daemons on a build that includes paseo#9781.
+The plugin's tests cover the decision tables, a pull against a local HTTP server with Skill and
+instructions digests computed by Nuhuo's own code, provider patches, and peer links. Hook wiring,
+delegation, and the screens need an [ad-hoc daemon](ad-hoc-daemon-testing.md) run with two daemons
+on 0.17.
